@@ -6,3 +6,8 @@ distribution = "2201.13.0"
 
 [build-options]
 observabilityIncluded = true
+
+[[dependency]]
+org = "ballerina"
+name = "toml"
+version = "0.8.0"

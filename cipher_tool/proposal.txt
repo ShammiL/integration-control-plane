@@ -1,0 +1,305 @@
+================================================================================
+                    CIPHER TOOL — DESIGN PROPOSAL
+================================================================================
+
+1. OVERVIEW
+--------------------------------------------------------------------------------
+
+The Cipher Tool is a Ballerina CLI utility that encrypts sensitive values in
+TOML configuration files using RSA asymmetric encryption. It reads a source
+TOML file, encrypts the values of user-specified keys, and writes the results
+to a new TOML file. A companion decrypt utility function is also provided for
+programmatic decryption.
+
+
+2. ARCHITECTURE
+--------------------------------------------------------------------------------
+
+2.1 High-Level Flow
+
+    Input TOML ──> Parse ──> Lookup Keys ──> RSA Encrypt ──> Base64 Encode
+                                                                  │
+                                                                  ▼
+                                                    Output TOML (_encrypted)
+
+2.2 Components
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  main.bal                                                          │
+    │                                                                    │
+    │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────────┐  │
+    │  │  CLI Arg      │  │  TOML Reader │  │  Nested Key Navigation  │  │
+    │  │  Parser       │  │  (manual)    │  │  (get / set)            │  │
+    │  └──────────────┘  └──────────────┘  └─────────────────────────┘  │
+    │                                                                    │
+    │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────────┐  │
+    │  │  RSA Encrypt  │  │  TOML Writer │  │  Decrypt Utility        │  │
+    │  │  (crypto)     │  │  (manual)    │  │  (public function)      │  │
+    │  └──────────────┘  └──────────────┘  └─────────────────────────┘  │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    resources/
+    ├── public_key.pem    (X509 self-signed certificate, contains RSA public key)
+    └── private_key.pem   (PKCS#8 RSA 2048-bit private key)
+
+
+3. CLI INTERFACE
+--------------------------------------------------------------------------------
+
+Usage:
+    bal run -- <toml_file> <key1> [key2] ... [--publicKeyPath=<path>]
+
+Arguments:
+    <toml_file>              Path to the input TOML file.
+    <key1> [key2] ...        One or more keys whose values should be encrypted.
+                             Supports dot notation for nested keys
+                             (e.g., "database.password", "database.credentials.token").
+    --publicKeyPath=<path>   (Optional) Path to a custom X509 certificate file
+                             containing the RSA public key. Defaults to the
+                             bundled resources/public_key.pem.
+
+Output:
+    A new file named <original_name>_encrypted.toml in the same directory.
+    Example: config.toml -> config_encrypted.toml
+
+Example:
+    bal run -- config.toml api_key database.password --publicKeyPath=my_cert.pem
+
+
+4. ENCRYPTION SCHEME
+--------------------------------------------------------------------------------
+
+Algorithm:      RSA with ECB mode
+Key Size:       2048 bits
+Padding:        PKCS#1 v1.5
+Output Format:  Base64-encoded ciphertext string
+
+Process per key:
+    1. Retrieve the plaintext value from the parsed TOML map.
+    2. Convert the value to a UTF-8 byte array (value.toBytes()).
+    3. Encrypt with crypto:encryptRsaEcb using the RSA public key.
+    4. Encode the resulting ciphertext bytes to a Base64 string.
+    5. Store the Base64 string in the output map under the same key path.
+
+
+5. DEFAULT KEY PAIR GENERATION
+--------------------------------------------------------------------------------
+
+The bundled RSA key pair was generated using OpenSSL:
+
+    # Step 1: Generate a 2048-bit RSA private key in PKCS#8 PEM format
+    openssl genpkey -algorithm RSA \
+        -out resources/private_key.pem \
+        -pkeyopt rsa_keygen_bits:2048
+
+    # Step 2: Generate a self-signed X509 certificate (10-year validity)
+    openssl req -new -x509 \
+        -key resources/private_key.pem \
+        -out resources/public_key.pem \
+        -days 3650 \
+        -subj "/CN=CipherTool"
+
+Rationale:
+    - Ballerina's crypto:decodeRsaPublicKeyFromCertFile requires an X509
+      certificate, not a raw public key file. Hence the self-signed cert.
+    - Ballerina's crypto:decodeRsaPrivateKeyFromKeyFile requires PKCS#8 PEM
+      format, which is the default output of openssl genpkey.
+
+
+6. TOML HANDLING
+--------------------------------------------------------------------------------
+
+6.1 Reader (readTomlFile)
+
+    A manual line-by-line parser that handles:
+    - Comments (lines starting with #)
+    - Table headers: [section] and [section.subsection]
+    - Key-value pairs with types: quoted strings, booleans, integers, floats
+    - Produces a nested map<json> structure
+
+6.2 Writer (writeTomlFile / buildTomlLines)
+
+    Converts a map<json> back to TOML format:
+    - Writes flat key-value pairs first at each level.
+    - Writes nested tables using [table.path] headers.
+    - Escapes special characters in string values (backslashes, quotes).
+
+6.3 Nested Key Navigation
+
+    - getNestedValue: Splits a dot-notation key (e.g., "a.b.c") and walks
+      the map<json> tree to retrieve the leaf value.
+    - setNestedValue: Splits a dot-notation key and creates intermediate
+      map<json> nodes as needed, then sets the leaf value.
+
+
+7. DECRYPT UTILITY
+--------------------------------------------------------------------------------
+
+    public function decrypt(
+        string encryptedBase64Value,
+        string privateKeyPath = "resources/private_key.pem"
+    ) returns string|error
+
+    - Loads the RSA private key from the given PEM file.
+    - Decodes the Base64 ciphertext to bytes.
+    - Decrypts using crypto:decryptRsaEcb with PKCS#1 padding.
+    - Returns the original plaintext string.
+
+    This function is public and can be imported by other Ballerina modules
+    that need to decrypt values produced by this tool.
+
+
+8. KNOWN DRAWBACKS
+--------------------------------------------------------------------------------
+
+8.1 RSA Plaintext Size Limit
+
+    RSA-2048 with PKCS#1 padding can only encrypt up to 245 bytes per
+    operation. Any TOML value longer than 245 bytes will cause a runtime
+    error. This is a hard limitation of raw RSA encryption.
+
+8.2 Incomplete TOML Parser
+
+    The manual TOML reader does NOT support the full TOML v1.0 spec.
+    Unsupported features include:
+    - Multi-line strings (""" ... """ and ''' ... ''')
+    - Inline tables ({ key = "value", ... })
+    - Array of tables ([[table]])
+    - Arrays ([1, 2, 3])
+    - Date/time types
+    - Escape sequences within quoted strings (e.g., \n, \t, \uXXXX)
+    - Dotted keys on the left-hand side (e.g., a.b.c = "value")
+    - Keys containing the '=' character
+
+8.3 Private Key Security
+
+    The default private key is bundled as a plain PEM file in the resources/
+    directory with no passphrase protection. Anyone with access to the tool's
+    file system can decrypt all encrypted values.
+
+8.4 No Key Rotation Support
+
+    There is no mechanism to re-encrypt values when keys are rotated. If the
+    RSA key pair is changed, all previously encrypted TOML files become
+    undecryptable unless the old private key is retained.
+
+8.5 ECB Mode Determinism
+
+    RSA-ECB with PKCS#1 v1.5 padding is probabilistic (due to random padding
+    bytes), so repeated encryptions of the same value produce different
+    ciphertexts. This is acceptable. However, PKCS#1 v1.5 is considered
+    legacy and is vulnerable to Bleichenbacher-style padding oracle attacks
+    in interactive protocols.
+
+8.6 Output Contains Only Encrypted Keys
+
+    The output TOML file contains only the keys that were encrypted, not the
+    full original file. Non-encrypted keys are lost in the output. This may
+    require consumers to merge both files.
+
+8.7 Private Key Loaded Per Call
+
+    The decrypt() utility re-reads and re-parses the private key file on
+    every invocation. In batch decryption scenarios, this is wasteful.
+
+
+9. SUGGESTED IMPROVEMENTS
+--------------------------------------------------------------------------------
+
+9.1 Hybrid Encryption (RSA + AES)
+
+    Use RSA to encrypt a randomly generated AES-256 session key, then use
+    AES-GCM to encrypt the actual values. This removes the 245-byte size
+    limit and is the industry-standard approach (envelope encryption).
+
+    Flow:
+        1. Generate random 256-bit AES key.
+        2. Encrypt each value with AES-256-GCM (unlimited size).
+        3. Encrypt the AES key with RSA and store it in the output TOML
+           under a reserved key (e.g., __encrypted_session_key__).
+
+9.2 Use OAEP Padding Instead of PKCS#1 v1.5
+
+    Switch from crypto:PKCS1 to crypto:OAEPWithSHA256AndMGF1 for stronger
+    padding that is resistant to padding oracle attacks. This is a one-line
+    change (reduces max plaintext to 190 bytes, but with hybrid encryption
+    this is not an issue since only the AES key is RSA-encrypted).
+
+9.3 Use a Standard TOML Library
+
+    Replace the manual parser with the ballerina/toml module (or equivalent)
+    once it is stable and available in the target Ballerina distribution.
+    This would provide full TOML v1.0 compliance including multi-line
+    strings, arrays, inline tables, and proper escape handling.
+
+9.4 Full-File Output with Selective Encryption
+
+    Instead of writing only encrypted keys, write the entire original TOML
+    file with only the specified keys replaced by their encrypted values.
+    This makes the output file self-contained and directly usable.
+
+9.5 Private Key Passphrase Protection
+
+    Support password-protected private keys using the keyPassword parameter
+    of crypto:decodeRsaPrivateKeyFromKeyFile. Prompt for or accept the
+    passphrase via CLI argument or environment variable.
+
+9.6 Key Rotation Command
+
+    Add a --rotate mode that:
+        1. Decrypts values using the old private key.
+        2. Re-encrypts them using a new public key.
+        3. Writes the updated encrypted TOML file.
+
+9.7 Decrypt Mode in CLI
+
+    Add a --decrypt flag so the tool can also be used to decrypt an
+    encrypted TOML file back to plaintext, making it a complete round-trip
+    CLI tool rather than requiring programmatic use of the decrypt function.
+
+    Example:
+        bal run -- encrypted.toml --decrypt --privateKeyPath=key.pem key1 key2
+
+9.8 Batch Decryption with Key Caching
+
+    Modify the decrypt utility to accept an already-loaded crypto:PrivateKey
+    instead of a file path, allowing callers to load the key once and reuse
+    it across multiple decrypt calls.
+
+================================================================================
+
+Step 1 — Generate the RSA private key:
+  openssl genpkey -algorithm RSA -out resources/private_key.pem -pkeyopt rsa_keygen_bits:2048
+  - genpkey generates a private key in PKCS#8 PEM format (which is what Ballerina's crypto:decodeRsaPrivateKeyFromKeyFile expects)
+  - -algorithm RSA specifies the RSA algorithm
+  - -pkeyopt rsa_keygen_bits:2048 sets the key size to 2048 bits (standard secure size; max plaintext per encryption = 245 bytes with PKCS1 padding)
+
+  Step 2 — Generate a self-signed X509 certificate containing the public key:
+  openssl req -new -x509 -key resources/private_key.pem -out resources/public_key.pem -days 3650 -subj "/CN=CipherTool"
+  - req -new -x509 creates a new self-signed X509 certificate
+  - -key private_key.pem extracts the public key from the private key and embeds it in the certificate
+  - -days 3650 makes it valid for ~10 years
+  - -subj "/CN=CipherTool" sets a minimal subject (just a common name, since this is for encryption only, not TLS)
+
+  The reason I used a certificate (not a raw public key file) is that Ballerina's crypto:decodeRsaPublicKeyFromCertFile specifically expects an X509
+  certificate file. The certificate is essentially a wrapper around the public key with some metadata. The private key file is kept in standard PKCS#8 PEM
+  format for future decryption use.
+
+-----------COMMANDS---------
+ # Encrypt (default mode, no passphrase needed)
+  bal run -- config.toml api_key database.password
+
+  # Decrypt
+  BAL_CONFIG_DATA='privateKeyPassphrase="changeme"' \
+    bal run -- config_encrypted.toml decrypt api_key database.password
+
+  # Rotate to a new key pair
+  BAL_CONFIG_DATA=$'privateKeyPassphrase="changeme"\nnewPublicKeyPath="resources/new_key.pem"' \
+    bal run -- config_encrypted.toml rotate api_key database.password
+  # produces config_rotated.toml
+
+  # Server-side (import the decrypt function)
+  string plaintext = check cipher_tool:decrypt(encryptedValue, privateKeyPath, passphrase);
+
+  Create private key: openssl genpkey -algorithm RSA -out /tmp/new_private.pem -pkeyopt rsa_keygen_bits:2048
+  Create public key: openssl req -new -x509 -key /tmp/new_private.pem -out /tmp/new_public.pem -days 3650 -subj "/CN=CipherTool-New"

@@ -1,73 +1,15 @@
-import ballerina/io;
 import ballerina/crypto;
 import ballerina/lang.array;
+import ballerina/toml;
 
-// --- TOML Reader ---
+// --- TOML Reader / Writer (delegated to ballerina/toml) ---
 
 function readTomlFile(string filePath) returns map<json>|error {
-    string[] lines = check io:fileReadLines(filePath);
-    map<json> result = {};
-    string currentTable = "";
-
-    foreach string line in lines {
-        string trimmed = line.trim();
-
-        if trimmed == "" || trimmed.startsWith("#") {
-            continue;
-        }
-
-        // Table header: [section] or [section.subsection]
-        if trimmed.startsWith("[") && !trimmed.startsWith("[[") && trimmed.endsWith("]") {
-            currentTable = trimmed.substring(1, trimmed.length() - 1).trim();
-            continue;
-        }
-
-        // Key-value pair
-        int? eqIndex = trimmed.indexOf("=");
-        if eqIndex is int {
-            string key = trimmed.substring(0, eqIndex).trim();
-            string rawValue = trimmed.substring(eqIndex + 1).trim();
-            json parsedValue = parseTomlValue(rawValue);
-
-            if currentTable != "" {
-                check setNestedValue(result, currentTable + "." + key, parsedValue);
-            } else {
-                result[key] = parsedValue;
-            }
-        }
-    }
-
-    return result;
+    return toml:readFile(filePath);
 }
 
-function parseTomlValue(string rawValue) returns json {
-    // Quoted string (double quotes)
-    if rawValue.startsWith("\"") && rawValue.endsWith("\"") && rawValue.length() >= 2 {
-        return rawValue.substring(1, rawValue.length() - 1);
-    }
-    // Quoted string (single quotes)
-    if rawValue.startsWith("'") && rawValue.endsWith("'") && rawValue.length() >= 2 {
-        return rawValue.substring(1, rawValue.length() - 1);
-    }
-    // Boolean
-    if rawValue == "true" {
-        return true;
-    }
-    if rawValue == "false" {
-        return false;
-    }
-    // Integer
-    int|error intVal = int:fromString(rawValue);
-    if intVal is int {
-        return intVal;
-    }
-    // Float
-    float|error floatVal = float:fromString(rawValue);
-    if floatVal is float {
-        return floatVal;
-    }
-    // Fallback: return as-is string
-    return rawValue;
+function writeTomlFile(string filePath, map<json> content) returns error? {
+    check toml:writeFile(filePath, content);
 }
 
 // --- Nested Key Navigation ---
@@ -110,7 +52,7 @@ function setNestedValue(map<json> content, string key, json value) returns error
     current[parts[parts.length() - 1]] = value;
 }
 
-// --- Output Path ---
+// --- Output Paths ---
 
 function getOutputPath(string inputPath) returns string {
     int? dotIndex = inputPath.lastIndexOf(".");
@@ -120,54 +62,43 @@ function getOutputPath(string inputPath) returns string {
     return inputPath + "_encrypted";
 }
 
-// --- TOML Writer ---
-
-function writeTomlFile(string filePath, map<json> content) returns error? {
-    string[] lines = [];
-    buildTomlLines(content, lines, "");
-    check io:fileWriteLines(filePath, lines);
-}
-
-function buildTomlLines(map<json> content, string[] lines, string prefix) {
-    // First: write simple key-value pairs at this level
-    foreach [string, json] [key, value] in content.entries() {
-        if value is map<json> {
-            continue; // handle tables after simple values
-        }
-        if value is string {
-            lines.push(key + " = \"" + escapeTomlString(value) + "\"");
-        } else {
-            lines.push(key + " = " + value.toString());
-        }
+// For rotate: strip an existing _encrypted suffix so that
+// config_encrypted.toml -> config_rotated.toml (not config_encrypted_rotated.toml).
+function getRotatedOutputPath(string inputPath) returns string {
+    int? dotIndex = inputPath.lastIndexOf(".");
+    if dotIndex is int {
+        string name = inputPath.substring(0, dotIndex);
+        string ext = inputPath.substring(dotIndex);
+        string base = name.endsWith("_encrypted")
+            ? name.substring(0, name.length() - 10)
+            : name;
+        return base + "_rotated" + ext;
     }
-
-    // Then: write nested tables
-    foreach [string, json] [key, value] in content.entries() {
-        if value is map<json> {
-            string tableName = prefix == "" ? key : prefix + "." + key;
-            lines.push("");
-            lines.push("[" + tableName + "]");
-            buildTomlLines(value, lines, tableName);
-        }
-    }
+    return inputPath + "_rotated";
 }
 
-function escapeTomlString(string value) returns string {
-    string result = re `\\`.replaceAll(value, "\\\\");
-    result = re `"`.replaceAll(result, "\\\"");
-    return result;
-}
 
 // --- Decryption Utility ---
 
 # Decrypts a Base64-encoded RSA-encrypted value back to the original plaintext string.
+# Intended for import by the ICP server to decrypt config values at startup.
 #
-# + encryptedBase64Value - the Base64-encoded ciphertext (as produced by the encrypt flow)
-# + privateKeyPath - path to the RSA private key PEM file (defaults to the bundled key)
-# + return - the decrypted plaintext string, or an error
+# + encryptedBase64Value - the Base64-encoded ciphertext produced by the encrypt command
+# + privateKeyPath       - path to the PKCS#8 RSA private key PEM file
+# + passphrase           - passphrase protecting the private key; "" for unprotected keys
+# + return               - the original plaintext string, or an error
 public function decrypt(string encryptedBase64Value,
-                        string privateKeyPath = DEFAULT_PRIVATE_KEY_PATH) returns string|error {
-    crypto:PrivateKey privateKey = check crypto:decodeRsaPrivateKeyFromKeyFile(privateKeyPath);
+                        string privateKeyPath = DEFAULT_PRIVATE_KEY_PATH,
+                        string passphrase = "") returns string|error {
+    crypto:PrivateKey privateKey = passphrase == ""
+        ? check crypto:decodeRsaPrivateKeyFromKeyFile(privateKeyPath)
+        : check crypto:decodeRsaPrivateKeyFromKeyFile(privateKeyPath, keyPassword = passphrase);
+    return check decryptWithKey(encryptedBase64Value, privateKey);
+}
+
+// Internal: decrypts using an already-loaded PrivateKey.
+// Used by the rotate path to avoid re-reading the key file for each value.
+function decryptWithKey(string encryptedBase64Value, crypto:PrivateKey privateKey) returns string|error {
     byte[] encryptedBytes = check array:fromBase64(encryptedBase64Value);
     byte[] decryptedBytes = check crypto:decryptRsaEcb(encryptedBytes, privateKey, crypto:PKCS1);
     return check string:fromBytes(decryptedBytes);

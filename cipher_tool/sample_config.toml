@@ -1,0 +1,15 @@
+title = "Sample Config"
+api_key = "sk-12345-secret-key"
+
+[database]
+host = "localhost"
+port = 5432
+username = "admin"
+password = "super_secret_password"
+
+[database.credentials]
+token = "eyJhbGciOiJIUzI1NiJ9.secret"
+
+[service]
+endpoint = "https://api.example.com"
+secret = "my-service-secret"
